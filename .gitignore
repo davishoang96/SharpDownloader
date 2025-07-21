@@ -1,0 +1,54 @@
+# Ignore build outputs
+bin/
+obj/
+[Bb]uild/
+[Bb]uilds/
+
+# User-specific files
+*.user
+*.userosscache
+*.suo
+*.sln.docstates
+*.vcxproj.user
+*.rsuser
+
+# Visual Studio cache/options
+.vs/
+*.VC.db
+*.VC.VC.opendb
+
+# NuGet
+*.nupkg
+*.snupkg
+packages/
+.nuget/
+project.lock.json
+project.fragment.lock.json
+
+# Logs
+*.log
+
+# Publish outputs
+*.publishsettings
+*.Publish.xml
+publish/
+
+# Others
+TestResult*/
+*.coverage
+*.coveragexml
+*.orig
+*.tmp
+*.cache
+
+# Rider/JetBrains IDEs
+.idea/
+*.iml
+
+# Mac specific
+.DS_Store
+
+# Windows specific
+Thumbs.db
+ehthumbs.db
+desktop.ini
