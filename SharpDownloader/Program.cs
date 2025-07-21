@@ -1,11 +1,4 @@
-﻿using System;
-using System.IO;
-using System.Linq;
-using System.Net.Http;
-using System.Threading;
-using System.Threading.Tasks;
-
-class MultiThreadDownloader
+﻿class MultiThreadDownloader
 {
     private static readonly HttpClient client = new HttpClient();
 
@@ -59,32 +52,38 @@ class MultiThreadDownloader
 
         await Task.WhenAll(tasks);
 
-        // Step 2: Merge parts (with progress)
-        Console.SetCursorPosition(0, threads + 2);
+        // Step 2: Merge parts (with progress at the bottom)
+        int mergeLine = threads + 9; // place merging progress below all UI
+        Console.SetCursorPosition(0, mergeLine);
         Console.WriteLine("\nMerging parts into final file...");
-        using (var finalFile = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None))
+
+        using (var finalFile = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 65536))
         {
             long mergedBytes = 0;
+            byte[] buffer = new byte[65536];
+
             for (int i = 0; i < threads; i++)
             {
                 string partFile = $"{outputPath}.part{i}";
-                long partSize = new FileInfo(partFile).Length;
+                using var partStream = new FileStream(partFile, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 65536);
 
-                using var partStream = new FileStream(partFile, FileMode.Open, FileAccess.Read);
-                byte[] buffer = new byte[8192];
                 int bytesRead;
                 while ((bytesRead = await partStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
                 {
                     await finalFile.WriteAsync(buffer, 0, bytesRead);
                     mergedBytes += bytesRead;
 
-                    double mergePercent = (double)mergedBytes / totalSize * 100;
-                    DrawMergeProgress(mergePercent);
+                    if (mergedBytes % (buffer.Length * 10) == 0 || bytesRead < buffer.Length)
+                    {
+                        double mergePercent = (double)mergedBytes / totalSize * 100;
+                        DrawMergeProgress(mergePercent, mergeLine + 1); // Pass target line
+                    }
                 }
-
                 partStream.Close();
-                File.Delete(partFile); // Clean up
+                File.Delete(partFile);
             }
+
+            DrawMergeProgress(100.0, mergeLine + 1);
         }
 
         Console.WriteLine("\nMerge complete.");
@@ -94,38 +93,67 @@ class MultiThreadDownloader
     {
         lock (Console.Out)
         {
-            // Per-thread progress bar
-            Console.SetCursorPosition(0, threadId);
+            long totalDownloaded = downloadedPerThread.Sum();
+            double elapsedSec = (DateTime.UtcNow - startTime).TotalSeconds;
+            double totalSpeedMBps = (totalDownloaded / 1024d / 1024d) / elapsedSec;
+            double remainingBytes = totalSize - totalDownloaded;
+            double etaSec = (totalSpeedMBps > 0) ? (remainingBytes / 1024d / 1024d) / totalSpeedMBps : 0;
+            TimeSpan eta = TimeSpan.FromSeconds(etaSec);
+
+            int innerWidth = 50;
+
+            string line1 = $" Total Size: {FormatSize(totalSize)}".PadRight(innerWidth);
+            string line2 = $" Downloaded: {FormatSize(totalDownloaded)}".PadRight(innerWidth);
+            string line3 = $" Speed: {totalSpeedMBps:F2} MB/s".PadRight(innerWidth);
+            string line4 = $" Time Left: {eta:hh\\:mm\\:ss}".PadRight(innerWidth);
+
+            string topBorder = "╔" + new string('═', innerWidth) + "╗";
+            string bottomBorder = "╚" + new string('═', innerWidth) + "╝";
+
+            Console.SetCursorPosition(0, 0);
+            Console.WriteLine(topBorder);
+            Console.WriteLine($"║{line1}║");
+            Console.WriteLine($"║{line2}║");
+            Console.WriteLine($"║{line3}║");
+            Console.WriteLine($"║{line4}║");
+            Console.WriteLine(bottomBorder);
+
+            // Draw total progress bar (below all threads)
+            double totalPercent = (double)totalDownloaded / totalSize * 100;
+            Console.SetCursorPosition(0, 6);
+            int totalFilled = (int)(barLength * totalPercent / 100);
+            string totalBar = new string('#', totalFilled) + new string('-', barLength - totalFilled);
+            Console.Write($"Total:  [{totalBar}] {totalPercent:F2}%");
+
+            // Draw per-thread progress bars (start after the box at line 6)
+            Console.SetCursorPosition(0, threadId + 7);
             int filled = (int)(barLength * percent / 100);
             string bar = new string('#', filled) + new string('-', barLength - filled);
             Console.Write($"Thread {threadId + 1}: [{bar}] {percent:F2}% {speedMBps:F2} MB/s   ");
-
-            // Combined total progress with ETA
-            long totalDownloaded = downloadedPerThread.Sum();
-            double totalPercent = (double)totalDownloaded / totalSize * 100;
-            double elapsedSec = (DateTime.UtcNow - startTime).TotalSeconds;
-            double totalSpeedMBps = (totalDownloaded / 1024d / 1024d) / elapsedSec;
-
-            double remainingBytes = totalSize - totalDownloaded;
-            double etaSec = (totalSpeedMBps > 0) ? (remainingBytes / 1024d / 1024d) / totalSpeedMBps : 0;
-
-            TimeSpan eta = TimeSpan.FromSeconds(etaSec);
-
-            Console.SetCursorPosition(0, downloadedPerThread.Length);
-            int totalFilled = (int)(barLength * totalPercent / 100);
-            string totalBar = new string('#', totalFilled) + new string('-', barLength - totalFilled);
-            Console.Write($"Total:  [{totalBar}] {totalPercent:F2}% {totalSpeedMBps:F2} MB/s ETA: {eta:hh\\:mm\\:ss}   ");
         }
     }
 
-    private static void DrawMergeProgress(double percent, int barLength = 40)
+    private static string FormatSize(long bytes)
+    {
+        string[] sizes = { "B", "KB", "MB", "GB", "TB" };
+        double len = bytes;
+        int order = 0;
+        while (len >= 1024 && order < sizes.Length - 1)
+        {
+            order++;
+            len /= 1024;
+        }
+        return $"{len:0.##} {sizes[order]}";
+    }
+
+    private static void DrawMergeProgress(double percent, int line, int barLength = 40)
     {
         lock (Console.Out)
         {
-            Console.SetCursorPosition(0, Console.CursorTop);
+            Console.SetCursorPosition(0, line); // Always draw at fixed position
             int filled = (int)(barLength * percent / 100);
             string bar = new string('#', filled) + new string('-', barLength - filled);
-            Console.Write($"\rMerging: [{bar}] {percent:F2}%   ");
+            Console.Write($"Merging: [{bar}] {percent:F2}%   ");
         }
     }
 
@@ -162,6 +190,7 @@ class MultiThreadDownloader
 
             Console.WriteLine("\nDownload complete. Press Enter to continue...");
             Console.ReadLine();
+            Console.Clear();
         }
     }
 }
