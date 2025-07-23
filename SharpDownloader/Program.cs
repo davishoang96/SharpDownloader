@@ -1,135 +1,212 @@
-﻿class MultiThreadDownloader
-{
-    private static readonly HttpClient client = new HttpClient();
+using System;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Text.Json;
+using System.Collections.Generic;
 
-    public static async Task DownloadFileAsync(string url, string outputPath, int threads = 8)
+class MultiThreadDownloader
+{
+    private static readonly HttpClient client = new HttpClient(new HttpClientHandler
     {
-        // Get file size
+        UseCookies = false,
+        MaxConnectionsPerServer = 8
+    });
+
+    private class ResumeData
+    {
+        public bool[] CompletedChunks { get; set; } = Array.Empty<bool>();
+        public long ChunkSize { get; set; }
+        public long TotalSize { get; set; }
+        public Dictionary<string, long> PartialOffsets { get; set; } = new();
+    }
+
+    private static readonly Queue<(DateTime Time, long Bytes)> speedSamples = new();
+    private static DateTime lastProgressUpdate = DateTime.UtcNow;
+
+    public static async Task DownloadFileAsync(string url, string outputPath, int threads = 8, int initialChunkMB = 8)
+    {
         var headResponse = await client.SendAsync(new HttpRequestMessage(HttpMethod.Head, url));
         headResponse.EnsureSuccessStatusCode();
         long totalSize = headResponse.Content.Headers.ContentLength ?? throw new Exception("Unknown file size");
 
-        long baseChunkSize = totalSize / threads;
-        long[] downloadedPerThread = new long[threads];
-        DateTime startTime = DateTime.UtcNow;
-
-        async Task DownloadRange(int threadId, long start, long end)
+        string resumeFile = $"{outputPath}.resume";
+        ResumeData resume = new ResumeData { TotalSize = totalSize };
+        if (File.Exists(resumeFile))
         {
-            string partFile = $"{outputPath}.part{threadId}";
-            var request = new HttpRequestMessage(HttpMethod.Get, url);
-            request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(start, end);
-
-            using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
-            response.EnsureSuccessStatusCode();
-
-            using var stream = await response.Content.ReadAsStreamAsync();
-            using var output = new FileStream(partFile, FileMode.Create, FileAccess.Write, FileShare.None);
-
-            byte[] buffer = new byte[8192];
-            int bytesRead;
-            long totalBytes = end - start + 1;
-
-            while ((bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length)) > 0)
-            {
-                await output.WriteAsync(buffer, 0, bytesRead);
-                Interlocked.Add(ref downloadedPerThread[threadId], bytesRead);
-
-                double percent = (double)downloadedPerThread[threadId] / totalBytes * 100;
-                double elapsedSec = (DateTime.UtcNow - startTime).TotalSeconds;
-                double speedMBps = (downloadedPerThread[threadId] / 1024d / 1024d) / elapsedSec;
-
-                DrawProgress(threadId, percent, speedMBps, downloadedPerThread, totalSize, startTime);
-            }
+            resume = JsonSerializer.Deserialize<ResumeData>(await File.ReadAllTextAsync(resumeFile)) ?? resume;
+            if (resume.TotalSize != totalSize) resume = new ResumeData { TotalSize = totalSize };
         }
 
-        // Step 1: Download all parts
-        var tasks = Enumerable.Range(0, threads).Select(i =>
+        long chunkSize = resume.ChunkSize > 0 ? resume.ChunkSize : initialChunkMB * 1024L * 1024L;
+        if (chunkSize < 8 * 1024 * 1024) chunkSize = 8 * 1024 * 1024;
+
+        int chunkCount = (int)Math.Ceiling((double)totalSize / chunkSize);
+        if (resume.CompletedChunks.Length != chunkCount)
+            resume.CompletedChunks = new bool[chunkCount];
+
+        if (!File.Exists(outputPath))
         {
-            long start = i * baseChunkSize;
-            long end = (i == threads - 1) ? totalSize - 1 : (start + baseChunkSize - 1);
-            return DownloadRange(i, start, end);
-        }).ToList();
+            using (var fs = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.Write))
+                fs.SetLength(totalSize);
+        }
 
-        await Task.WhenAll(tasks);
+        long[] downloadedPerThread = new long[threads];
+        long totalDownloaded = resume.CompletedChunks
+            .Select((done, idx) => done ? Math.Min(chunkSize, totalSize - idx * chunkSize) : 0)
+            .Sum();
 
-        // Step 2: Merge parts (with progress at the bottom)
-        int mergeLine = threads + 9; // place merging progress below all UI
-        Console.SetCursorPosition(0, mergeLine);
-        Console.WriteLine("\nMerging parts into final file...");
+        DateTime startTime = DateTime.UtcNow;
+        object chunkLock = new object();
 
-        using (var finalFile = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 65536))
-        {
-            long mergedBytes = 0;
-            byte[] buffer = new byte[65536];
-
-            for (int i = 0; i < threads; i++)
+        var chunks = Enumerable.Range(0, chunkCount)
+            .Where(i => !resume.CompletedChunks[i])
+            .Select(i =>
             {
-                string partFile = $"{outputPath}.part{i}";
-                using var partStream = new FileStream(partFile, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 65536);
+                long start = i * chunkSize;
+                long end = Math.Min(totalSize - 1, start + chunkSize - 1);
+                return (Index: i, Start: start, End: end);
+            }).ToList();
 
-                int bytesRead;
-                while ((bytesRead = await partStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+        var partialOffsets = resume.PartialOffsets ?? new Dictionary<string, long>();
+
+        async Task Worker(int threadId)
+        {
+            while (true)
+            {
+                (int Index, long Start, long End) chunk;
+                lock (chunkLock)
                 {
-                    await finalFile.WriteAsync(buffer, 0, bytesRead);
-                    mergedBytes += bytesRead;
+                    if (!chunks.Any()) break;
+                    chunk = chunks[0];
+                    chunks.RemoveAt(0);
+                }
 
-                    if (mergedBytes % (buffer.Length * 10) == 0 || bytesRead < buffer.Length)
+                long resumeOffset = chunk.Start;
+                string chunkKey = $"Chunk_{chunk.Index}";
+
+                if (partialOffsets.TryGetValue(chunkKey, out long savedOffset))
+                    resumeOffset = chunk.Start + savedOffset;
+
+                if (resumeOffset > chunk.End)
+                {
+                    resume.CompletedChunks[chunk.Index] = true;
+                    lock (partialOffsets) partialOffsets.Remove(chunkKey);
+                    continue;
+                }
+
+                var request = new HttpRequestMessage(HttpMethod.Get, url);
+                request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(resumeOffset, chunk.End);
+
+                using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+                response.EnsureSuccessStatusCode();
+
+                using var stream = await response.Content.ReadAsStreamAsync();
+                using var output = new FileStream(outputPath, FileMode.Open, FileAccess.Write, FileShare.Write, 1024 * 1024, useAsync: true);
+                output.Seek(resumeOffset, SeekOrigin.Begin);
+
+                byte[] buffer = new byte[1024 * 1024]; // 1MB buffer
+                int bytesRead;
+
+                while ((bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                {
+                    await output.WriteAsync(buffer, 0, bytesRead);
+                    resumeOffset += bytesRead;
+
+                    Interlocked.Add(ref downloadedPerThread[threadId], bytesRead);
+                    Interlocked.Add(ref totalDownloaded, bytesRead);
+
+                    // Track partial offset (relative to chunk start)
+                    lock (partialOffsets) partialOffsets[chunkKey] = resumeOffset - chunk.Start;
+
+                    if ((DateTime.UtcNow - lastProgressUpdate).TotalMilliseconds >= 500)
                     {
-                        double mergePercent = (double)mergedBytes / totalSize * 100;
-                        DrawMergeProgress(mergePercent, mergeLine + 1); // Pass target line
+                        double percent = (double)totalDownloaded / totalSize * 100;
+                        double elapsedSec = (DateTime.UtcNow - startTime).TotalSeconds;
+                        double avgSpeedMBps = (totalDownloaded / 1024d / 1024d) / elapsedSec;
+                        DrawProgress(outputPath, percent, avgSpeedMBps, downloadedPerThread, totalSize, startTime, threads);
+                        lastProgressUpdate = DateTime.UtcNow;
                     }
                 }
-                partStream.Close();
-                File.Delete(partFile);
-            }
 
-            DrawMergeProgress(100.0, mergeLine + 1);
+                resume.CompletedChunks[chunk.Index] = true;
+                lock (partialOffsets) partialOffsets.Remove(chunkKey);
+            }
         }
 
-        Console.WriteLine("\nMerge complete.");
+        var workers = Enumerable.Range(0, threads).Select(id => Worker(id)).ToArray();
+
+        // Periodically save resume state
+        var saver = Task.Run(async () =>
+        {
+            while (!Task.WhenAll(workers).IsCompleted)
+            {
+                lock (partialOffsets)
+                {
+                    resume.PartialOffsets = new Dictionary<string, long>(partialOffsets);
+                }
+                resume.ChunkSize = chunkSize;
+                await File.WriteAllTextAsync(resumeFile, JsonSerializer.Serialize(resume));
+                await Task.Delay(5000);
+            }
+        });
+
+        await Task.WhenAll(workers);
+        await saver;
+
+        // Mark all chunks complete and delete resume file
+        resume.CompletedChunks = Enumerable.Repeat(true, chunkCount).ToArray();
+        await File.WriteAllTextAsync(resumeFile, JsonSerializer.Serialize(resume));
+        File.Delete(resumeFile);
+
+        Console.SetCursorPosition(0, threads + 8);
+        Console.WriteLine("\nDownload complete.");
     }
 
-    private static void DrawProgress(int threadId, double percent, double speedMBps, long[] downloadedPerThread, long totalSize, DateTime startTime, int barLength = 40)
+    private static void DrawProgress(string fileName, double avgSpeedMBps, double totalSpeedMBps, long[] downloadedPerThread, long totalSize, DateTime startTime, int threads, int barLength = 50)
     {
         lock (Console.Out)
         {
             long totalDownloaded = downloadedPerThread.Sum();
-            double elapsedSec = (DateTime.UtcNow - startTime).TotalSeconds;
-            double totalSpeedMBps = (totalDownloaded / 1024d / 1024d) / elapsedSec;
-            double remainingBytes = totalSize - totalDownloaded;
-            double etaSec = (totalSpeedMBps > 0) ? (remainingBytes / 1024d / 1024d) / totalSpeedMBps : 0;
+            DateTime now = DateTime.UtcNow;
+
+            // Smooth instant speed (last 3 seconds)
+            speedSamples.Enqueue((now, totalDownloaded));
+            while (speedSamples.Count > 0 && (now - speedSamples.Peek().Time).TotalSeconds > 3)
+                speedSamples.Dequeue();
+
+            double instantSpeedMBps = 0;
+            if (speedSamples.Count >= 2)
+            {
+                var first = speedSamples.Peek();
+                var last = speedSamples.Last();
+                double bytesDelta = last.Bytes - first.Bytes;
+                double seconds = (last.Time - first.Time).TotalSeconds;
+                instantSpeedMBps = (seconds > 0) ? (bytesDelta / 1024d / 1024d) / seconds : 0;
+            }
+
+            long remainingBytes = totalSize - totalDownloaded;
+            double etaSec = (instantSpeedMBps > 0) ? (remainingBytes / 1024d / 1024d) / instantSpeedMBps : 0;
             TimeSpan eta = TimeSpan.FromSeconds(etaSec);
 
-            int innerWidth = 50;
-
-            string line1 = $" Total Size: {FormatSize(totalSize)}".PadRight(innerWidth);
-            string line2 = $" Downloaded: {FormatSize(totalDownloaded)}".PadRight(innerWidth);
-            string line3 = $" Speed: {totalSpeedMBps:F2} MB/s".PadRight(innerWidth);
-            string line4 = $" Time Left: {eta:hh\\:mm\\:ss}".PadRight(innerWidth);
-
-            string topBorder = "╔" + new string('═', innerWidth) + "╗";
-            string bottomBorder = "╚" + new string('═', innerWidth) + "╝";
+            double percent = (double)totalDownloaded / totalSize * 100;
 
             Console.SetCursorPosition(0, 0);
-            Console.WriteLine(topBorder);
-            Console.WriteLine($"║{line1}║");
-            Console.WriteLine($"║{line2}║");
-            Console.WriteLine($"║{line3}║");
-            Console.WriteLine($"║{line4}║");
-            Console.WriteLine(bottomBorder);
+            Console.WriteLine($" File: {fileName}");
+            Console.WriteLine($" Speed: {instantSpeedMBps:F2} MB/s (avg: {avgSpeedMBps:F2} MB/s) | ETA: {eta:hh\\:mm\\:ss} | {FormatSize(totalDownloaded)} / {FormatSize(totalSize)}");
 
-            // Draw total progress bar (below all threads)
-            double totalPercent = (double)totalDownloaded / totalSize * 100;
-            Console.SetCursorPosition(0, 6);
-            int totalFilled = (int)(barLength * totalPercent / 100);
-            string totalBar = new string('#', totalFilled) + new string('-', barLength - totalFilled);
-            Console.Write($"Total:  [{totalBar}] {totalPercent:F2}%");
-
-            // Draw per-thread progress bars (start after the box at line 6)
-            Console.SetCursorPosition(0, threadId + 7);
             int filled = (int)(barLength * percent / 100);
             string bar = new string('#', filled) + new string('-', barLength - filled);
-            Console.Write($"Thread {threadId + 1}: [{bar}] {percent:F2}% {speedMBps:F2} MB/s   ");
+            Console.WriteLine($" [{bar}] {percent:F2}%");
+
+            for (int i = 0; i < threads; i++)
+            {
+                double threadMB = downloadedPerThread[i] / 1024d / 1024d;
+                Console.SetCursorPosition(0, 4 + i);
+                Console.WriteLine($" Thread {i + 1}: {threadMB:F2} MB downloaded       ");
+            }
         }
     }
 
@@ -146,17 +223,6 @@
         return $"{len:0.##} {sizes[order]}";
     }
 
-    private static void DrawMergeProgress(double percent, int line, int barLength = 40)
-    {
-        lock (Console.Out)
-        {
-            Console.SetCursorPosition(0, line); // Always draw at fixed position
-            int filled = (int)(barLength * percent / 100);
-            string bar = new string('#', filled) + new string('-', barLength - filled);
-            Console.Write($"Merging: [{bar}] {percent:F2}%   ");
-        }
-    }
-
     public static void Main(string[] args)
     {
         Run().GetAwaiter().GetResult();
@@ -164,33 +230,16 @@
 
     private static async Task Run()
     {
-        string url = "";
-        while (true)
-        {
-            Console.Write("Enter file URL to download (or type 'exit' to quit): ");
-            url = Console.ReadLine()?.Trim() ?? "";
+        Console.Write("Enter file URL to download: ");
+        string url = Console.ReadLine()?.Trim() ?? "";
+        if (string.IsNullOrEmpty(url)) return;
 
-            if (url.Equals("exit", StringComparison.OrdinalIgnoreCase))
-                break;
+        string outputPath = Path.GetFileName(new Uri(url).LocalPath);
+        if (string.IsNullOrWhiteSpace(outputPath)) outputPath = "downloaded.file";
 
-            if (string.IsNullOrEmpty(url))
-            {
-                Console.WriteLine("No URL provided. Try again.");
-                continue;
-            }
-
-            string outputPath = Path.GetFileName(new Uri(url).LocalPath);
-            if (string.IsNullOrWhiteSpace(outputPath))
-                outputPath = "downloaded.file";
-
-            Console.Clear();
-            Console.CursorVisible = false;
-            await DownloadFileAsync(url, outputPath, 8);
-            Console.CursorVisible = true;
-
-            Console.WriteLine("\nDownload complete. Press Enter to continue...");
-            Console.ReadLine();
-            Console.Clear();
-        }
+        Console.Clear();
+        Console.CursorVisible = false;
+        await DownloadFileAsync(url, outputPath, 8, 8);
+        Console.CursorVisible = true;
     }
 }
